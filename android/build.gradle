@@ -1,0 +1,37 @@
+plugins { id 'com.android.application' version '8.7.3' }
+
+def generated = providers.gradleProperty('fnvGenerated').orNull
+def nativeTls = providers.gradleProperty('fnvNativeTls').orNull == 'true'
+def fixedMemory = providers.gradleProperty('fnvFixedMemory').orNull == 'true'
+if (!generated || !file("${generated}/probe_cases.h").isFile()) {
+    throw new GradleException('Run prepare.py with your local New Vegas installation first.')
+}
+
+android {
+    namespace 'org.fnvprobe'
+    compileSdk 35
+    ndkVersion '27.2.12479018'
+    defaultConfig {
+        applicationId 'org.fnvprobe'
+        minSdk nativeTls ? 29 : 26
+        targetSdk 35
+        versionCode 150
+        versionName fixedMemory ? '0.150-fixed-mojave-launcher' : '0.150-mojave-launcher'
+        ndk { abiFilters 'arm64-v8a' }
+        externalNativeBuild {
+            cmake {
+                arguments "-DFNV_GENERATED=${file(generated).absolutePath}",
+                          "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+                          "-DFNV_NATIVE_TLS=${nativeTls ? 'ON' : 'OFF'}",
+                          "-DFNV_FIXED_MEMORY=${fixedMemory ? 'ON' : 'OFF'}"
+            }
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    externalNativeBuild { cmake { path 'CMakeLists.txt'; version '3.22.1' } }
+}
+
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }

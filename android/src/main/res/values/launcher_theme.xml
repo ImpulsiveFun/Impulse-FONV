@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="NewVegasLauncher" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#15130F</item>
+        <item name="android:colorAccent">#FFC375</item>
+        <item name="android:alertDialogTheme">@style/NewVegasDialog</item>
+        <item name="android:statusBarColor">#15130F</item>
+        <item name="android:navigationBarColor">#15130F</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+    <style name="NewVegasDialog" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">#FFC375</item>
+        <item name="android:colorBackgroundFloating">#30271D</item>
+    </style>
+    <color name="launcher_icon_background">#231811</color>
+</resources>

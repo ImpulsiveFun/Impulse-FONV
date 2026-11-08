@@ -1,0 +1,11 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <instrumentation android:name="org.fnvprobe.ProbeInstrumentation"
+        android:targetPackage="org.fnvprobe" android:label="Local startup checks" />
+    <application>
+        <activity android:name="org.fnvprobe.ProbePreviewActivity" android:exported="true"
+            android:permission="android.permission.DUMP" android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar.Fullscreen" />
+        <receiver android:name="org.fnvprobe.ProbeControlReceiver" android:exported="true"
+            android:permission="android.permission.DUMP" />
+    </application>
+</manifest>

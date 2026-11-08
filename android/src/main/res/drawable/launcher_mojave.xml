@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="400dp" android:height="200dp" android:viewportWidth="400" android:viewportHeight="200">
+    <path android:fillColor="#8B492F" android:fillAlpha=".34"
+        android:pathData="M282,12 A67,67 0,1 1,281.9 146 A67,67 0,1 1,282 12 Z" />
+    <path android:fillColor="#D88754" android:fillAlpha=".72"
+        android:pathData="M282,21 A58,58 0,1 1,281.9 137 A58,58 0,1 1,282 21 Z" />
+    <path android:strokeColor="#502D22" android:strokeWidth="2" android:strokeAlpha=".8"
+        android:pathData="M225,85 H339 M228,95 H336 M234,105 H330 M243,115 H321 M253,125 H311" />
+    <path android:fillColor="#623C2A"
+        android:pathData="M0,157 L26,143 L65,143 L119,118 L151,128 L179,103 L205,112 L232,102 L258,119
+                          L282,106 L304,118 L333,95 L351,101 L378,76 L400,89 L400,200 L0,200 Z" />
+    <path android:fillColor="#37261D"
+        android:pathData="M0,177 L36,162 L80,172 L115,156 L159,160 L177,149 L215,150 L242,140
+                          L271,146 L296,133 L317,140 L353,118 L379,130 L400,117 L400,200 L0,200 Z" />
+    <path android:fillColor="#211A14"
+        android:pathData="M0,194 L62,186 L114,192 L167,182 L203,185 L244,173 L266,174 L302,160
+                          L328,157 L355,146 L385,152 L400,147 L400,200 L0,200 Z" />
+    <path android:fillColor="#AC6944" android:fillAlpha=".8"
+        android:pathData="M278,147 L290,147 L326,200 L205,200 Z" />
+    <path android:fillColor="#36291F"
+        android:pathData="M280,147 L287,147 L310,200 L223,200 Z" />
+    <path android:fillColor="#FFC875" android:fillAlpha=".78"
+        android:pathData="M283.4,154 H284.7 L284.9,159 H282.8 Z M282,165 H284.9 L285.3,172 H280.5 Z
+                          M279,181 H285.5 L286,192 H276 Z" />
+    <path android:fillColor="#FFD084"
+        android:pathData="M342,29 L344,35 L350,37 L344,39 L342,45 L340,39 L334,37 L340,35 Z
+                          M372,50 L373,53 L376,54 L373,55 L372,58 L371,55 L368,54 L371,53 Z" />
+</vector>
