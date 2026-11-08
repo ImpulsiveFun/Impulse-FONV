@@ -99,6 +99,10 @@ When reporting an issue, include the app version, phone model, Android version, 
 
 ## Credits and distribution
 
+AI tools, including OpenAI Codex, assisted with development, debugging, testing, and documentation.
+
+Thanks to momusdigital and the Fallout: New Vegas decompilation contributors for their work on reverse engineering and game preservation. [Fallout: New Vegas decompilation project](https://github.com/momusdigital/fnv_decomp)
+
 The repository contains source, documentation, original launcher art, synthetic test generators, and license notices. Keep the original game executable, assets, DLC, saves, translated C, and personal playable APK private. GitHub releases can offer the separate setup checker.
 
 Fallout and Fallout: New Vegas identify the original game and belong to their respective rights holders. This project is unaffiliated with the game's publishers and developers. [Upstream MIT license](LICENSE) · [Credits and dependency notices](NOTICES.md)
