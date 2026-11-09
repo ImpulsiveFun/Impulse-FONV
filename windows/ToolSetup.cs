@@ -17,13 +17,16 @@ internal sealed class ToolSetup
     private readonly string cache;
     private readonly bool offline;
     private readonly Action<string> log;
+    private readonly Action<string> reportStage;
     private readonly Func<string, bool> acceptLicense;
 
-    internal ToolSetup(string cache, bool offline, Action<string> log, Func<string, bool> acceptLicense)
+    internal ToolSetup(string cache, bool offline, Action<string> log, Action<string> reportStage,
+        Func<string, bool> acceptLicense)
     {
         this.cache = cache;
         this.offline = offline;
         this.log = log;
+        this.reportStage = reportStage;
         this.acceptLicense = acceptLicense;
     }
 
@@ -58,6 +61,7 @@ internal sealed class ToolSetup
 
     private void CheckGame(string root, IDictionary<string, string> paths)
     {
+        reportStage("Checking your game files.");
         string args = "-B android/prepare.py --check-only " + BuildProcess.Quote(paths["GamePath"]);
         if (paths["Executable"].Length > 0) args += " --exe " + BuildProcess.Quote(paths["Executable"]);
         var info = new ProcessStartInfo(paths["PythonCommand"], args)
@@ -95,7 +99,7 @@ internal sealed class ToolSetup
             source.Position = 0;
             if (!File.Exists(Path.Combine(root, "Build-Windows.ps1")))
             {
-                log("Unpacking the build source.");
+                reportStage("Unpacking the build source.");
                 InstallArchive(root, "Build-Windows.ps1", stage => ExtractZip(source, stage));
             }
             return root;
@@ -126,7 +130,7 @@ internal sealed class ToolSetup
         string installed = Path.Combine(target, entry);
         if (File.Exists(installed)) return installed;
         if (offline) throw new InvalidOperationException(label + " is missing. Turn off offline mode to download it.");
-        log("Downloading " + label + "...");
+        reportStage("Downloading " + label + ".");
         string download = Path.Combine(cache, "download-" + Guid.NewGuid().ToString("N") + ".zip");
         try
         {
@@ -147,12 +151,13 @@ internal sealed class ToolSetup
                     next += interval;
                 }
             }
+            reportStage("Checking the " + label + " download.");
             using (var file = File.OpenRead(download))
             {
                 if (!String.Equals(Sha256(file), hash, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException("The " + label + " download did not match its checksum.");
             }
-            log("Extracting " + label + "...");
+            reportStage("Extracting " + label + ".");
             InstallArchive(target, entry, stage => ExtractWithWindowsTar(download, stage), configure);
         }
         catch (WebException error)
@@ -237,7 +242,7 @@ internal sealed class ToolSetup
                 "https://dl.google.com/android/repository/commandlinetools-win-13114758_latest.zip",
                 "98b565cb657b012dae6794cefc0f66ae1efb4690c699b78a614b4a6a3505b003");
             Directory.CreateDirectory(sdk);
-            log("Installing the Android SDK. This may take a while.");
+            reportStage("Installing the Android SDK. This may take a while.");
             var args = new[] { "-classpath", manager, "com.android.sdklib.tool.sdkmanager.SdkManagerCli",
                 "--sdk_root=" + sdk, "--install", "platforms;android-35", "build-tools;34.0.0",
                 "ndk;27.2.12479018", "cmake;3.22.1" };

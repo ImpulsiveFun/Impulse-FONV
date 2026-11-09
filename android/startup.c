@@ -52,6 +52,7 @@ extern int host_mmio_selftest(void);
 extern int host_validate_base_assets(char *message, size_t capacity);
 extern int host_threads_selftest(CPU *cpu);
 extern void host_window_configure(uint32_t width, uint32_t height);
+extern void host_window_configure_render_mode(uint32_t width, uint32_t height);
 extern void host_win_reset(void);
 extern int host_win_selftest(void);
 extern void host_dinput_reset(void);
@@ -82,6 +83,13 @@ JNIEXPORT void JNICALL Java_org_fnvprobe_ProbeActivity_configureWindow(
         JNIEnv *env, jclass cls, jint width, jint height) {
     (void)env; (void)cls;
     host_window_configure((uint32_t)width, (uint32_t)height);
+}
+extern void host_graphics_configure_texture_detail(unsigned skip);
+JNIEXPORT void JNICALL Java_org_fnvprobe_ProbeActivity_configureRenderMode(
+        JNIEnv *env, jclass cls, jint width, jint height, jint texture_skip) {
+    (void)env; (void)cls;
+    host_window_configure_render_mode((uint32_t)width, (uint32_t)height);
+    host_graphics_configure_texture_detail((unsigned)texture_skip);
 }
 extern int host_virtual_selftest(void);
 
@@ -404,10 +412,11 @@ JNIEXPORT jstring JNICALL Java_org_fnvprobe_ProbeActivity_expectedExecutableDige
     (void)cls;return (*env)->NewStringUTF(env,STARTUP_SHA256);
 }
 
-extern void host_graphics_set_surface(ANativeWindow *window);
+extern void host_graphics_set_surface(ANativeWindow *window,int width,int height);
 extern int host_graphics_surface_selftest(void);
-JNIEXPORT void JNICALL Java_org_fnvprobe_ProbeActivity_configureSurface(JNIEnv *env,jclass cls,jobject surface) {
-    (void)cls;host_graphics_set_surface(surface?ANativeWindow_fromSurface(env,surface):NULL);
+JNIEXPORT void JNICALL Java_org_fnvprobe_ProbeActivity_configureSurfaceGeometry(
+        JNIEnv *env,jclass cls,jobject surface,jint width,jint height) {
+    (void)cls;host_graphics_set_surface(surface?ANativeWindow_fromSurface(env,surface):NULL,width,height);
 }
 JNIEXPORT jstring JNICALL Java_org_fnvprobe_ProbeActivity_runSurfaceCheck(JNIEnv *env,jclass cls) {
     (void)cls;
@@ -479,6 +488,11 @@ JNIEXPORT jstring JNICALL Java_org_fnvprobe_ProbeActivity_runReleasedInputCheck(
 }
 
 extern void host_graphics_request_capture(void);
+extern uint64_t host_graphics_window_frames(void);
+JNIEXPORT jlong JNICALL Java_org_fnvprobe_ProbeActivity_presentedFrames(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    return (jlong)host_graphics_window_frames();
+}
 JNIEXPORT void JNICALL Java_org_fnvprobe_ProbeActivity_requestTraceStop(JNIEnv *env,jclass cls){
     (void)env;(void)cls;rt_request_trace_stop();
 }

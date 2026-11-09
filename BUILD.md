@@ -4,9 +4,13 @@ Use an ARM64 phone running Android 10 or later with OpenGL ES 3.1. The setup APK
 
 ## Windows build for later transfer
 
-Open the standalone **New-Vegas-Windows-Builder-v2.0.exe** on 64-bit Windows 10 or 11. Pick the PC game folder and a private output folder, then click **Build APK and ZIP**. The builder extracts its source and caches missing tools under `%LOCALAPPDATA%\NewVegasBuilder`. Android SDK setup asks you to review the license. A first build needs internet access and can take a while.
+Open the standalone **New-Vegas-Windows-Builder-v2.2.exe** on 64-bit Windows 10 or 11. Pick the PC game folder and a private output folder, then click **Build APK and ZIP**. The builder extracts its source and caches missing tools under `%LOCALAPPDATA%\NewVegasBuilder`. Android SDK setup asks you to review the license. A first build needs internet access and can take a while.
 
-The **Tools** tab lets you use an alternate compatible game executable or supply your own tool paths. After a successful online build, you can select **Use cached dependencies only** for later builds.
+The animated bar and stage label stay visible during long steps such as installing tools, translating the executable, compiling the APK, and creating the ZIP. The bar fills when the build succeeds and clears if the build stops.
+
+The build needs a compatible 32-bit Windows executable with unencrypted game code. If your Steam copy uses SteamStub DRM, use Steamless by atom0s on your own `FalloutNV.exe`. To use the default build path, back up the original EXE outside the game folder, rename the unpacked EXE to exactly `FalloutNV.exe`, and replace the original next to `Data`. You can also keep the installation untouched by selecting the unpacked file under **Tools → Separate EXE (optional)** or passing its path to `-Executable`. Use that same executable for the APK and import ZIP. [Steamless by atom0s](https://github.com/atom0s/Steamless)
+
+The **Tools** tab lets you use an alternate compatible game executable or supply your own tool paths. Leave **Use cached dependencies only** off for the first build with each builder version. The builder checks the audio dependencies before translating the game. After a successful online build with that version, you can select cached-only mode for later builds.
 
 To compile the standalone builder from the repository, run `windows/Build-Launcher.ps1 -OutputFile .\New-Vegas-Windows-Builder.exe` on Windows with the 64-bit .NET Framework 4.x compiler. The script embeds the build source in the EXE.
 

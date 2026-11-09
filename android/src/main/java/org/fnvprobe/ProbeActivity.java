@@ -3,6 +3,8 @@ package org.fnvprobe;
 
 
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.AlertDialog;
 
 import android.content.Intent;
 
@@ -10,6 +12,7 @@ import android.content.Intent;
 import android.net.Uri;
 
 import android.os.Bundle;
+import android.os.SystemClock;
 
 import android.util.Log;
 
@@ -24,6 +27,8 @@ import android.view.SurfaceView;
 import android.view.View;
 
 import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -61,7 +66,10 @@ public final class ProbeActivity extends Activity {
     static native String expectedExecutableDigest();
     static native String virtualAdapterDescription();
 
-    static native void configureSurface(Surface surface);
+    private static native void configureSurfaceGeometry(Surface surface, int width, int height);
+    static void configureSurface(Surface surface) {
+        configureSurfaceGeometry(surface, 0, 0);
+    }
 
     static synchronized native String runSurfaceCheck();
     static native void inputKey(int code, boolean down);
@@ -72,6 +80,7 @@ public final class ProbeActivity extends Activity {
     static native void configureInputScript(boolean enabled);
     static native void inputMotion(int dx, int dy);
     static native boolean gameMenuActive();
+    private static native long presentedFrames();
     static native boolean checkTouchAim(boolean fire, boolean forward, int dx);
     static native void inputWheel(int delta);
     static native void inputButton(int button, boolean down);
@@ -82,13 +91,25 @@ public final class ProbeActivity extends Activity {
     static synchronized native String runReleasedInputCheck();
 
     static synchronized native void configureWindow(int width, int height);
+    private static synchronized native void configureRenderMode(int width, int height, int textureSkip);
 
     static synchronized native String runStartup(byte[] file, String digest, String gameRoot, int seconds);
 
     static String traceStartup(byte[] file,String digest,String gameRoot,int seconds) throws Exception {
+        return traceStartup(file, digest, gameRoot, seconds, null, TextureDetail.HIGH);
+    }
+
+    private static String traceStartup(byte[] file, String digest, String gameRoot, int seconds,
+                                       GameConfiguration.Resolution resolution, TextureDetail detail) throws Exception {
         java.util.concurrent.FutureTask<String> task=new java.util.concurrent.FutureTask<>(() -> {
-            GameConfiguration.prepare(new File(gameRoot), virtualAdapterDescription());
-            return runStartup(file,digest,gameRoot,seconds);
+            GameConfiguration.prepare(new File(gameRoot), virtualAdapterDescription(), resolution);
+            configureRenderMode(resolution == null ? 0 : resolution.width, resolution == null ? 0 : resolution.height,
+                                detail.mipSkip);
+            try {
+                return runStartup(file,digest,gameRoot,seconds);
+            } finally {
+                configureRenderMode(0, 0, 0);
+            }
         });
         new Thread(null,task,"fnv-game",32L*1024*1024).start();
         return task.get();
@@ -109,14 +130,34 @@ public final class ProbeActivity extends Activity {
 
     private static final AtomicBoolean PLAYING = new AtomicBoolean();
     private static final int MAX_EXECUTABLE_BYTES = 32 * 1024 * 1024;
+    private static final String RESOLUTION_SETTING = "render-resolution";
+    private static final String FPS_SETTING = "show-fps";
+    private static final String TEXTURE_DETAIL_SETTING = "texture-detail";
+    private enum TextureDetail {
+        HIGH("High", 0), MEDIUM("Medium", 1), LOW("Low", 2);
+        final String label;
+        final int mipSkip;
+        TextureDetail(String label, int mipSkip) {
+            this.label = label;
+            this.mipSkip = mipSkip;
+        }
+    }
+    private static final long FPS_SAMPLE_MS = 1000;
     private TextView result;
-    private Button startup, assets, dlcAssets, mods, lookSettings, touchLayout;
+    private Button startup, assets, dlcAssets, mods, lookSettings, touchLayout, resolutionButton, exteriorDetailButton;
+    private Button textureDetailButton;
+    private TextureDetail textureDetail = TextureDetail.HIGH;
+    private GameConfiguration.Resolution resolution;
     private RadioGroup controlMode;
     private int controllerModeId;
     private SurfaceView preview;
     private FrameLayout previewFrame;
     private ScrollView setupScroll;
     private InputOverlay controls;
+    private CheckBox fpsSetting;
+    private TextView fpsMeter;
+    private long fpsSampleTime, fpsSampleFrames;
+    private final Runnable sampleFps = this::updateFpsReading;
     private volatile boolean libraryReady;
     private boolean traceRunning, resumed, busy;
     private boolean normalSession;
@@ -135,6 +176,28 @@ public final class ProbeActivity extends Activity {
     private void updateGameControls() {
         controls.setActive(traceRunning && resumed);
         preview.setKeepScreenOn(traceRunning && resumed);
+        fpsMeter.removeCallbacks(sampleFps);
+        boolean showFps = normalSession && traceRunning && resumed && fpsSetting.isChecked();
+        fpsMeter.setVisibility(showFps ? View.VISIBLE : View.GONE);
+        if (showFps) {
+            fpsMeter.setText("FPS —");
+            fpsSampleFrames = presentedFrames();
+            fpsSampleTime = SystemClock.elapsedRealtime();
+            fpsMeter.postDelayed(sampleFps, FPS_SAMPLE_MS);
+        }
+    }
+
+    private void updateFpsReading() {
+        long now = SystemClock.elapsedRealtime();
+        long frames = presentedFrames();
+        long elapsed = now - fpsSampleTime;
+        if (elapsed > 0) {
+            long fps = Math.round((frames - fpsSampleFrames) * 1000.0 / elapsed);
+            fpsMeter.setText(fps + " FPS");
+        }
+        fpsSampleFrames = frames;
+        fpsSampleTime = now;
+        fpsMeter.postDelayed(sampleFps, FPS_SAMPLE_MS);
     }
 
     private void setBusy(boolean value) {
@@ -145,6 +208,10 @@ public final class ProbeActivity extends Activity {
         mods.setEnabled(!value && libraryReady);
         lookSettings.setEnabled(!value && libraryReady);
         touchLayout.setEnabled(!value);
+        resolutionButton.setEnabled(!value && libraryReady);
+        exteriorDetailButton.setEnabled(!value && libraryReady);
+        textureDetailButton.setEnabled(!value && libraryReady);
+        fpsSetting.setEnabled(!value);
         for (int i = 0; i < controlMode.getChildCount(); ++i) controlMode.getChildAt(i).setEnabled(!value);
     }
 
@@ -162,6 +229,29 @@ public final class ProbeActivity extends Activity {
             else pickFile(PICK_EXE, "*/*");
         });
         style.addAction(playCard, startup);
+        String savedResolution = getPreferences(MODE_PRIVATE).getString(RESOLUTION_SETTING, "");
+        for (GameConfiguration.Resolution mode : GameConfiguration.Resolution.values()) {
+            if (mode.name().equals(savedResolution)) resolution = mode;
+        }
+        resolutionButton = style.button(resolutionLabel(), false);
+        resolutionButton.setOnClickListener(view -> showResolutionPicker());
+        style.addAction(playCard, resolutionButton);
+        String savedDetail = getPreferences(MODE_PRIVATE).getString(TEXTURE_DETAIL_SETTING, "");
+        for (TextureDetail detail : TextureDetail.values())
+            if (detail.name().equals(savedDetail)) textureDetail = detail;
+        textureDetailButton = style.button(textureDetailLabel(), false);
+        textureDetailButton.setOnClickListener(view -> showTextureDetail());
+        style.addAction(playCard, textureDetailButton);
+        exteriorDetailButton = style.button("Exterior detail", false);
+        exteriorDetailButton.setOnClickListener(view -> showExteriorDetail());
+        style.addAction(playCard, exteriorDetailButton);
+        fpsSetting = new CheckBox(this);
+        fpsSetting.setText("Show FPS in game");
+        fpsSetting.setTextColor(0xfff8ebd4);
+        fpsSetting.setChecked(getPreferences(MODE_PRIVATE).getBoolean(FPS_SETTING, false));
+        fpsSetting.setOnCheckedChangeListener((view, checked) ->
+                getPreferences(MODE_PRIVATE).edit().putBoolean(FPS_SETTING, checked).apply());
+        style.addAction(playCard, fpsSetting);
         result = style.status();
         result.setText("Checking game runtime…");
         playCard.addView(result, new LinearLayout.LayoutParams(-1, -2));
@@ -225,11 +315,9 @@ public final class ProbeActivity extends Activity {
         previewFrame.setVisibility(View.GONE);
         preview = new SurfaceView(this);
         preview.getHolder().addCallback(new SurfaceHolder.Callback() {
-            @Override public void surfaceCreated(SurfaceHolder holder) {
-                if (libraryReady) configureSurface(holder.getSurface());
-            }
+            @Override public void surfaceCreated(SurfaceHolder holder) {}
             @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-                if (libraryReady) configureSurface(holder.getSurface());
+                if (libraryReady) configureSurfaceGeometry(holder.getSurface(), width, height);
             }
             @Override public void surfaceDestroyed(SurfaceHolder holder) {
                 if (libraryReady) configureSurface(null);
@@ -238,6 +326,17 @@ public final class ProbeActivity extends Activity {
         previewFrame.addView(preview, new FrameLayout.LayoutParams(-1, -1));
         controls = new InputOverlay(this, preview);
         previewFrame.addView(controls, new FrameLayout.LayoutParams(-1, -1));
+        fpsMeter = new TextView(this);
+        fpsMeter.setTextColor(0xffffffff);
+        fpsMeter.setBackgroundColor(0xc0000000);
+        fpsMeter.setTypeface(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD);
+        fpsMeter.setTextSize(14);
+        fpsMeter.setPadding(style.dp(8), style.dp(4), style.dp(8), style.dp(4));
+        fpsMeter.setVisibility(View.GONE);
+        FrameLayout.LayoutParams fpsPosition = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.END);
+        fpsPosition.topMargin = style.dp(16);
+        fpsPosition.setMarginEnd(style.dp(16));
+        previewFrame.addView(fpsMeter, fpsPosition);
 
         FrameLayout root = new FrameLayout(this);
         setupScroll = new ScrollView(this);
@@ -285,8 +384,143 @@ public final class ProbeActivity extends Activity {
                 libraryReady = loaded;
                 result.setText(outcome);
                 setBusy(false);
+                if (loaded && state == null && resolution == null && !isFinishing()) showResolutionPicker();
             });
         }, "fnv-probe").start();
+    }
+
+    private String resolutionLabel() {
+        return resolution == null ? "Render resolution" : "Render resolution · " + resolution.label();
+    }
+
+    private void showResolutionPicker() {
+        ActivityManager manager = getSystemService(ActivityManager.class);
+        ActivityManager.MemoryInfo memory = new ActivityManager.MemoryInfo();
+        manager.getMemoryInfo(memory);
+        android.util.DisplayMetrics display = getResources().getDisplayMetrics();
+        GameConfiguration.Resolution suggested = GameConfiguration.Resolution.suggested(
+                memory.totalMem, Math.min(display.widthPixels, display.heightPixels), manager.isLowRamDevice());
+        GameConfiguration.Resolution[] modes = GameConfiguration.Resolution.values();
+        String[] labels = new String[modes.length];
+        for (int i = 0; i < modes.length; i++) {
+            labels[i] = modes[i].label() + (modes[i] == suggested ? " (suggested)" : "");
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Render resolution")
+                .setSingleChoiceItems(labels, (resolution == null ? suggested : resolution).ordinal(), null)
+                .setPositiveButton("Apply", (dialog, which) -> {
+                    int selected = ((AlertDialog) dialog).getListView().getCheckedItemPosition();
+                    if (selected < 0) return;
+                    resolution = modes[selected];
+                    getPreferences(MODE_PRIVATE).edit().putString(RESOLUTION_SETTING, resolution.name()).apply();
+                    resolutionButton.setText(resolutionLabel());
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private String textureDetailLabel() {
+        return "Texture detail · " + textureDetail.label;
+    }
+
+    private void showTextureDetail() {
+        TextureDetail[] options = TextureDetail.values();
+        String[] labels = {"High · full detail", "Medium · smaller textures", "Low · smallest textures"};
+        new AlertDialog.Builder(this)
+                .setTitle("Texture detail")
+                .setSingleChoiceItems(labels, textureDetail.ordinal(), null)
+                .setPositiveButton("Apply", (dialog, which) -> {
+                    int selected = ((AlertDialog) dialog).getListView().getCheckedItemPosition();
+                    if (selected < 0) return;
+                    textureDetail = options[selected];
+                    getPreferences(MODE_PRIVATE).edit().putString(TEXTURE_DETAIL_SETTING, textureDetail.name()).apply();
+                    textureDetailButton.setText(textureDetailLabel());
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void showExteriorDetail() {
+        final File root;
+        final String[] values;
+        try {
+            root = new File(prepareGameRoot(this));
+            values = GameConfiguration.exteriorDetail(root);
+        } catch (IOException error) {
+            result.setText("Could not read exterior detail settings: " + error.getMessage());
+            return;
+        }
+
+        LinearLayout fields = new LinearLayout(this);
+        fields.setOrientation(LinearLayout.VERTICAL);
+        int padding = new LauncherStyle(this).dp(24);
+        fields.setPadding(padding, 0, padding, 0);
+        fields.setFocusableInTouchMode(true);
+        TextView explanation = new TextView(this);
+        explanation.setText("Lower values draw less grass and distant scenery. Applies the next time you play.");
+        fields.addView(explanation);
+        EditText grass = detailField(fields, "Grass draw distance (0–7000)", values[0]);
+        EditText objects = detailField(fields, "Scenery draw distance multiplier (1–15)", values[1]);
+        Button performance = new Button(this);
+        performance.setText("Performance preset");
+        performance.setOnClickListener(view -> {
+            grass.setText(GameConfiguration.PERFORMANCE_GRASS);
+            objects.setText(GameConfiguration.PERFORMANCE_OBJECTS);
+        });
+        fields.addView(performance);
+        Button standard = new Button(this);
+        standard.setText("Standard preset");
+        standard.setOnClickListener(view -> {
+            grass.setText(GameConfiguration.STANDARD_GRASS);
+            objects.setText(GameConfiguration.STANDARD_OBJECTS);
+        });
+        fields.addView(standard);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(fields);
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Exterior detail")
+                .setView(scroll)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Apply", null)
+                .show();
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+            String grassValue = detailValue(grass, 0, 7000);
+            String objectValue = detailValue(objects, 1, 15);
+            if (grassValue == null || objectValue == null) return;
+            try {
+                GameConfiguration.saveExteriorDetail(root, grassValue, objectValue);
+                dialog.dismiss();
+                result.setText("Exterior detail saved. Tap Play to use the new settings.");
+            } catch (IOException error) {
+                grass.setError("Could not save settings: " + error.getMessage());
+            }
+        });
+    }
+
+    private EditText detailField(LinearLayout fields, String title, String value) {
+        TextView label = new TextView(this);
+        label.setText(title);
+        EditText field = new EditText(this);
+        field.setId(View.generateViewId());
+        label.setLabelFor(field.getId());
+        field.setSingleLine(true);
+        field.setInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        field.setText(value);
+        fields.addView(label);
+        fields.addView(field);
+        return field;
+    }
+
+    private static String detailValue(EditText field, int min, int max) {
+        String value = field.getText().toString().trim().replace(',', '.');
+        try {
+            if (value.matches("[0-9]{1,4}(\\.[0-9]{1,4})?")) {
+                double number = Double.parseDouble(value);
+                if (number >= min && number <= max) return value;
+            }
+        } catch (NumberFormatException ignored) {}
+        field.setError("Enter a value from " + min + " to " + max + " with up to four decimal places.");
+        return null;
     }
 
     private File installedExecutable() {
@@ -366,10 +600,12 @@ public final class ProbeActivity extends Activity {
         normalSession = true;
         setPlayClosing(false);
         setGameRunning(true);
+        GameConfiguration.Resolution selectedResolution = resolution;
+        TextureDetail selectedDetail = textureDetail;
         new Thread(() -> {
             String outcome;
             try {
-                outcome = traceStartup(executable, digest, root, 0);
+                outcome = traceStartup(executable, digest, root, 0, selectedResolution, selectedDetail);
                 Log.i("FNVProbe", outcome);
                 if (outcome.startsWith("Guest requested ExitProcess(0)") || outcome.startsWith("Startup stopped by request"))
                     outcome = "Game closed. Tap Play, then Continue to resume a saved game.";
@@ -422,6 +658,7 @@ public final class ProbeActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        fpsMeter.removeCallbacks(sampleFps);
         if (normalSession) setPlayClosing(true);
         else if (libraryReady && traceRunning) requestTraceStop();
         super.onDestroy();

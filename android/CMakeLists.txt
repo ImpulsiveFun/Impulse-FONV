@@ -54,7 +54,7 @@ endforeach()
 add_library(fnvprobe SHARED probe.c startup.c ${staged_sources})
 target_include_directories(fnvprobe PRIVATE ../recomp ../recomp/host "${FNV_GENERATED}")
 target_compile_features(fnvprobe PRIVATE c_std_11)
-target_link_libraries(fnvprobe PRIVATE m aaudio log EGL GLESv3 android vorbisfile vorbisenc)
+target_link_libraries(fnvprobe PRIVATE m dl aaudio log EGL GLESv3 android vorbisfile vorbisenc)
 target_link_options(fnvprobe PRIVATE -Wl,-Bsymbolic-functions)
 
 # Lifted p-code has many temporary values; basic optimization is essential.

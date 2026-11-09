@@ -171,9 +171,9 @@ final class LauncherStyle {
         return button;
     }
 
-    void addAction(LinearLayout card, Button button) {
+    void addAction(LinearLayout card, View action) {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
         if (card.getChildCount() > 0) params.topMargin = dp(6);
-        card.addView(button, params);
+        card.addView(action, params);
     }
 }

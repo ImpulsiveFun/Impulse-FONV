@@ -12,7 +12,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("New Vegas Recomp Builder")]
 [assembly: AssemblyDescription("Local Windows build launcher for New Vegas Recomp on Android")]
-[assembly: AssemblyVersion("2.0.0.0")]
+[assembly: AssemblyVersion("2.2.0.0")]
 
 internal static class Builder
 {
@@ -27,6 +27,8 @@ internal static class Builder
 
 internal static class BuildProcess
 {
+    internal const string StagePrefix = "FNV_BUILD_STAGE: ";
+
     internal static ProcessStartInfo Create(string root, IEnumerable<KeyValuePair<string, string>> paths,
         bool keepZip, bool offline, IDictionary<string, string> settings)
     {
@@ -36,6 +38,7 @@ internal static class BuildProcess
             if (path.Value.Length > 0) args.Append(" -").Append(path.Key).Append(' ').Append(Quote(path.Value));
         if (keepZip) args.Append(" -SkipGameZip");
         if (offline) args.Append(" -Offline");
+        args.Append(" -ShowBuildStages");
         var info = new ProcessStartInfo
         {
             FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe"),
@@ -69,6 +72,7 @@ internal sealed class BuilderWindow : Form
     private readonly TabPage toolsTab = new TabPage("Tools");
     private readonly TextBox log = new TextBox();
     private readonly Label status = new Label();
+    private readonly ProgressBar progress = new ProgressBar();
     private readonly Button build = new Button();
     private readonly Button openOutput = new Button();
     private readonly CheckBox offline = new CheckBox();
@@ -114,6 +118,13 @@ internal sealed class BuilderWindow : Form
         PathRow(inputs, "OutputPath", "Output folder",
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "New Vegas Android"), null);
         Note(inputs, "The first build downloads missing tools. Later builds can reuse the downloads.");
+        status.Text = "Ready to build on this PC.";
+        status.AutoSize = true;
+        AddWide(inputs, status);
+        progress.AccessibleName = "Build progress";
+        progress.Dock = DockStyle.Top;
+        progress.Height = 18;
+        AddWide(inputs, progress);
         log.Multiline = true;
         log.ReadOnly = true;
         log.ScrollBars = ScrollBars.Vertical;
@@ -141,8 +152,8 @@ internal sealed class BuilderWindow : Form
         PathRow(tools, "GeneratedPath", "Reuse translation (optional)", "", null);
         offline.Text = "Use cached dependencies only";
         offline.AutoSize = true;
-        offline.Checked = Setting("Offline", "false") == "true";
         AddWide(tools, offline);
+        Note(tools, "Leave cached-only mode off for the first build with this version. The builder downloads missing dependencies.");
         keepZip.Text = "Keep my existing game ZIP and build only the APK";
         keepZip.AutoSize = true;
         keepZip.Checked = Setting("SkipGameZip", "false") == "true";
@@ -162,12 +173,8 @@ internal sealed class BuilderWindow : Form
             if (Directory.Exists(output)) Process.Start("explorer.exe", BuildProcess.Quote(output));
             else status.Text = "The output folder will be created when you build.";
         };
-        status.Text = "Ready to build on this PC.";
-        status.AutoSize = true;
-        status.Margin = new Padding(12, 9, 0, 0);
         footer.Controls.Add(build);
         footer.Controls.Add(openOutput);
-        footer.Controls.Add(status);
         surface.Controls.Add(footer, 0, 2);
     }
 
@@ -251,7 +258,7 @@ internal sealed class BuilderWindow : Form
     {
         foreach (string key in paths.Keys) settings[key] = Value(key);
         settings["SkipGameZip"] = keepZip.Checked ? "true" : "false";
-        settings["Offline"] = offline.Checked ? "true" : "false";
+        settings.Remove("Offline");
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(settingsFile));
@@ -302,7 +309,7 @@ internal sealed class BuilderWindow : Form
         status.Text = "Preparing the build tools.";
         try
         {
-            var setup = new ToolSetup(cache, buildOffline, LogLine,
+            var setup = new ToolSetup(cache, buildOffline, LogLine, LogStage,
                 license => (bool)Invoke(new Func<string, bool>(ShowLicense), license));
             string source = await Task.Run(() => setup.Prepare(root, buildPaths));
             StartProcess(BuildProcess.Create(source, buildPaths, skipZip, buildOffline, settings));
@@ -354,6 +361,7 @@ internal sealed class BuilderWindow : Form
                 running = null;
                 process.Dispose();
                 SetBusy(false);
+                if (code == 0) progress.Value = progress.Maximum;
                 status.Text = code == 0 ? "Build finished. Open the output folder." : "Build stopped. See the output above.";
             }));
         });
@@ -361,12 +369,17 @@ internal sealed class BuilderWindow : Form
 
     private void SetBusy(bool busy)
     {
-        if (busy) tabs.SelectedTab = buildTab;
+        if (busy)
+        {
+            tabs.SelectedTab = buildTab;
+            progress.Value = 0;
+        }
+        progress.Style = busy ? ProgressBarStyle.Marquee : ProgressBarStyle.Continuous;
         build.Enabled = !busy;
         openOutput.Enabled = !busy;
         toolsTab.Enabled = !busy;
         foreach (Control input in buildTab.Controls[0].Controls)
-            if (input != log) input.Enabled = !busy;
+            if (input != log && input != status && input != progress) input.Enabled = !busy;
     }
 
     private bool ShowLicense(string license)
@@ -397,14 +410,36 @@ internal sealed class BuilderWindow : Form
             dialog.Controls.Add(panel);
             dialog.CancelButton = decline;
             dialog.ActiveControl = decline;
-            return dialog.ShowDialog(this) == DialogResult.OK;
+            string previousStage = status.Text;
+            status.Text = "Waiting for you to review the Android SDK terms.";
+            progress.Style = ProgressBarStyle.Continuous;
+            try { return dialog.ShowDialog(this) == DialogResult.OK; }
+            finally
+            {
+                status.Text = previousStage;
+                progress.Style = ProgressBarStyle.Marquee;
+            }
         }
     }
 
     private void LogLine(string line)
     {
         if (line == null || line.StartsWith("Adding ", StringComparison.Ordinal)) return;
+        if (line.StartsWith(BuildProcess.StagePrefix, StringComparison.Ordinal))
+        {
+            LogStage(line.Substring(BuildProcess.StagePrefix.Length));
+            return;
+        }
         BeginInvoke(new Action<string>(Append), line);
+    }
+
+    private void LogStage(string stage)
+    {
+        BeginInvoke(new Action(delegate
+        {
+            status.Text = stage;
+            Append(stage);
+        }));
     }
 
     private void Append(string line) { log.AppendText(line + Environment.NewLine); }

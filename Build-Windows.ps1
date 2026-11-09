@@ -11,7 +11,8 @@ param(
     [string]$PythonCommand = 'python',
     [string]$GradleCommand = 'gradle',
     [switch]$Offline,
-    [switch]$SkipGameZip
+    [switch]$SkipGameZip,
+    [switch]$ShowBuildStages
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,6 +36,14 @@ function Test-InDirectory([string]$Path, [string]$Directory) {
 function Invoke-Checked([string]$Command, [string[]]$Arguments) {
     & $Command @Arguments
     if ($LASTEXITCODE -ne 0) { throw "$Command failed with exit code $LASTEXITCODE." }
+}
+
+function Write-BuildStage([string]$Message) {
+    if ($ShowBuildStages) {
+        Write-Host "FNV_BUILD_STAGE: $Message"
+    } else {
+        Write-Host $Message
+    }
 }
 
 if (!(Test-Path -LiteralPath $game -PathType Container)) { throw 'GamePath must be an installed game directory.' }
@@ -91,7 +100,18 @@ $oldPath = $env:Path
 New-Item -ItemType Directory -Path $output -Force | Out-Null
 Push-Location $repo
 try {
+    if ($Offline) {
+        foreach ($codec in @('libogg-1.3.6', 'libvorbis-1.3.7')) {
+            if (!(Test-Path -LiteralPath "third_party/$codec/CMakeLists.txt" -PathType Leaf)) {
+                throw "Cached-only mode needs $codec. In the builder, open Tools, clear 'Use cached dependencies only', and build again with internet access. For a command-line build, omit -Offline."
+            }
+        }
+    } else {
+        Write-BuildStage 'Checking audio codec dependencies.'
+        Invoke-Checked $PythonCommand @('-B', 'tools/get_codecs.py')
+    }
     if (!(Test-Path -LiteralPath $image)) {
+        Write-BuildStage 'Analyzing and translating the game executable.'
         $env:JAVA_HOME = $GhidraJavaHome
         $env:Path = "$GhidraJavaHome\bin;$oldPath"
         Invoke-Checked $PythonCommand @('-B', 'android/prepare.py', $game, '--exe', $exe, '--ghidra', $GhidraHeadless,
@@ -100,15 +120,6 @@ try {
     } else {
         Write-Host "Using the local translation in $generated"
     }
-    if ($Offline) {
-        foreach ($codec in @('libogg-1.3.6', 'libvorbis-1.3.7')) {
-            if (!(Test-Path -LiteralPath "third_party/$codec/CMakeLists.txt" -PathType Leaf)) {
-                throw "Offline build needs $codec. Run python tools/get_codecs.py while connected first."
-            }
-        }
-    } else {
-        Invoke-Checked $PythonCommand @('-B', 'tools/get_codecs.py')
-    }
     $env:JAVA_HOME = $GradleJavaHome
     $env:Path = "$GradleJavaHome\bin;$oldPath"
     $env:ANDROID_HOME = $sdk
@@ -116,10 +127,13 @@ try {
     $gradleArgs = @('--no-daemon', '-p', 'android', 'assembleDebug', "-PfnvGenerated=$generated",
         '-PfnvNativeTls=true', '-PfnvFixedMemory=true')
     if ($Offline) { $gradleArgs += '--offline' }
+    Write-BuildStage 'Compiling and packaging the Android APK.'
     Invoke-Checked $GradleCommand $gradleArgs
+    Write-BuildStage 'Copying the APK to your output folder.'
     Copy-Item -LiteralPath 'android/build/outputs/apk/debug/NewVegasRecompProbe-debug.apk' -Destination $apk -Force
     Write-Host "Playable APK: $apk"
     if (!$SkipGameZip) {
+        Write-BuildStage 'Creating the private game ZIP.'
         Invoke-Checked $PythonCommand @('-B', '-m', 'tools.make_game_zip', $game, $zip, '--exe', $exe)
         Write-Host "Private game ZIP: $zip"
     }
