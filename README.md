@@ -16,16 +16,17 @@ An independent Android ARM64 port of Fallout: New Vegas built through static rec
 
 - **On Windows** you need Windows 10 or 11 (64-bit), an installed PC copy of Fallout: New Vegas, free disk space for the build tools and output, and internet access for the first build.
 - **On Android** you need an ARM64 device running Android 10 or later with OpenGL ES 3.1. Allow space for the ZIP and its extracted game data at the same time. The full import accepts up to 32 GiB of extracted files.
-- **For the executable** use the same unencrypted 32-bit Windows executable for both the build and the ZIP. The tested 1.4.0.525 executable has SHA-256 `19406942e48724d797300c4ea6be9ac69a32f670b8c35db09279a2258422739f`. Other executable hashes are unverified. File checks identify a format and a matching build. They do not verify a purchase.
+- **For the executable** you need a compatible 32-bit Windows `FalloutNV.exe` with unencrypted game code. The tested 1.4.0.525 executable has SHA-256 `19406942e48724d797300c4ea6be9ac69a32f670b8c35db09279a2258422739f`. Other executable hashes are unverified. The APK and import ZIP must use the same executable.
 
 ## Build the APK on Windows
 
-1. Download and open **New-Vegas-Windows-Builder-v2.0.exe**.
+1. Download and open **New-Vegas-Windows-Builder-v2.2.exe**.
 2. Choose the folder containing your PC game's `Data/` folder, then choose a private output folder.
-3. Click **Build APK and ZIP**. The builder downloads and caches missing tools. If it needs to set up the Android SDK, review the license in the builder.
-4. When it finishes, click **Open output folder** to find the playable APK and import ZIP.
+3. If your Steam copy uses SteamStub DRM, unpack your own `FalloutNV.exe` with Steamless by atom0s. To use the builder's default path, back up the original EXE outside the game folder, rename the unpacked EXE to exactly `FalloutNV.exe`, and put it in the original file's place next to `Data`. Leave **Tools → Separate EXE (optional)** blank. If you prefer to keep the installation untouched, select the unpacked file in that field instead. The builder uses the selected executable for both outputs. [Steamless by atom0s](https://github.com/atom0s/Steamless)
+4. Click **Build APK and ZIP**. The progress bar shows activity and the label names the current step, even when the log is quiet. If the builder needs to set up the Android SDK, review the license to continue.
+5. When it finishes, click **Open output folder** to find the playable APK and import ZIP.
 
-Use the **Tools** tab to select a separate compatible executable, reuse an existing ZIP, or build offline after a successful online build.
+Use the **Tools** tab to select a separate compatible executable or reuse an existing ZIP. Leave **Use cached dependencies only** off until this builder version completes an online build.
 
 The phone can stay disconnected while the builder runs.
 
@@ -45,6 +46,13 @@ Keep your signing key so future APKs can update the app in place. [Advanced buil
 4. Choose **Touch controls** or **Controller only**, then tap **Play**. Select **Continue** in the game menu to resume an existing save.
 
 If you're updating the same app with a matching signing key and your game files are already imported, transfer only the APK.
+
+### Display and performance settings
+
+- **Resolution** offers 640 × 480, 800 × 600, 1280 × 720, and 1920 × 1080. The initial suggestion uses available device memory and display size as a starting point.
+- **Texture detail** offers High, Medium, and Low. High is the default. Medium and Low use smaller texture mip levels.
+- **Exterior detail** lets you adjust grass draw distance and object fade distance. The Performance preset reduces both settings.
+- **Show FPS in game** adds an optional frame-rate display.
 
 ### What goes in the base ZIP
 
@@ -83,7 +91,7 @@ If you see **“This executable differs from the one used to build this APK”**
 | --- | --- |
 | Recompilation and startup | ARM64 ahead-of-time build with Android replacements for Windows file access, memory, threads, synchronization, timing, and other startup services. |
 | Graphics | Direct3D 9 rendering through OpenGL ES, including runtime shader translation to GLSL, texture handling, and support for occlusion queries. |
-| Performance and stability | Cached shader uniform locations and graphics state, reduced redundant uploads and state changes, and worked through renderer stops encountered during outdoor play. Frame rate and stutter vary by device and scene. |
+| Performance and stability | Cached shader uniform locations and graphics state, reduced redundant uploads and state changes, added ARM64 SIMD for selected routines and Android frame scheduling hints where supported, and fixed a crash in the transition out of Doc Mitchell's house. Frame rate and stutter vary by device and scene. |
 | Audio | DirectSound PCM mixing through AAudio, Vorbis and media playback adapters, and a WAV-loading fix for weapon sounds. |
 | Touch controls | Virtual movement stick and swipe aiming, dedicated gameplay buttons, a movable and resizable layout, and touch aim sensitivity separate from the controller. With aim held, tapping the movement stick fires. **View** switches between first and third person. |
 | Controllers | Android Bluetooth gamepad input presented to the game through an Xbox-style interface, adjustable right-stick sensitivity, and a controller-only mode that hides touch controls. |
