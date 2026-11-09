@@ -9,6 +9,7 @@ outdir/emit_report.json (which functions were skipped and why).
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter
 
@@ -23,6 +24,30 @@ X87_POP = {"FSTP", "FISTP", "FISTTP", "FBSTP", "FADDP", "FSUBP", "FSUBRP", "FMUL
 X87_POP2 = {"FCOMPP", "FUCOMPP"}
 X87_RESET = {"FINIT", "FNINIT"}
 FPUSW = 4258
+PACKED_HOT_ROUTINES = {0xc7f640, 0xca37e0}
+PACKED_REGISTER_OP = re.compile(r"(ADDPS|SUBPS|MULPS|SHUFPS|MOVAPS) XMM([0-7]),XMM([0-7])(?:,(0x[0-9a-f]+))?", re.I)
+
+
+def packed_register_instruction(entry, mnemonic):
+    """Use packed operations in the two measured exterior math routines."""
+    if entry not in PACKED_HOT_ROUTINES:
+        return None
+    match = PACKED_REGISTER_OP.fullmatch(mnemonic)
+    if not match:
+        return None
+    op, dst, src, immediate = match.groups()
+    op = op.upper()
+    # Ghidra's 32-bit x86 register space gives each XMM register a 64-byte slot.
+    left, right = (f"R+{4608 + int(reg) * 64}" for reg in (dst, src))
+    if op == "SHUFPS":
+        if immediate is None or int(immediate, 16) > 255:
+            return None
+        return f"rt_packed_shuffle({left},{right},{immediate});"
+    if immediate is not None:
+        return None
+    if op == "MOVAPS":
+        return f"ST({left},LD({right},16),16);"
+    return f"rt_packed_{op[:-2].lower()}({left},{right});"
 
 
 def top_delta(mnemonic):
@@ -526,7 +551,10 @@ class FnEmitter:
             a = insn["a"]
             self.ptargets = set()
             mn = insn["m"].split()[0].upper()
-            if mn == "CPUID":
+            packed = packed_register_instruction(fn["entry"], insn["m"])
+            if packed is not None:
+                opl = [packed]
+            elif mn == "CPUID":
                 self.gw.update(["eax", "ebx", "ecx", "edx"]); self.gr.add("eax")
                 opl, insn = [f"SAVE_REGS;rt_cpuid(c);LOAD_REGS;"], dict(insn, ops=[["COPY", None, []]])
             elif mn in ("FPREM", "FPREM1"):
@@ -711,6 +739,8 @@ def main():
             return
         text = ('#include "rt.h"\n#pragma clang diagnostic ignored "-Wunused-label"\n'
                 + "".join(f"void g_{hx(t)}(CPU *);\n" for t in sorted(refs)) + "\n".join(chunk))
+        if "rt_packed_" in text:
+            text = '#include "rt_packed.h"\n' + text
         write_if_changed(os.path.join(args.outdir, f"tu_{chunk_key:05x}.c"), text)
         tu_idx += 1
         chunk, refs = [], set()

@@ -16,10 +16,30 @@ static uint32_t wndproc;
 static uint32_t display_width = 1920, display_height = 1080, client_width = 1280, client_height = 720;
 #ifdef __ANDROID__
 static uint32_t desktop_width=1920,desktop_height=1080;
+static uint32_t render_width, render_height;
+
+void host_window_configure_render_mode(uint32_t width, uint32_t height) {
+    render_width = width;
+    render_height = height;
+}
+
+void host_window_adapter_mode(uint32_t *width, uint32_t *height) {
+    if (render_width && render_height) {
+        *width = render_width;
+        *height = render_height;
+    }
+}
+
+static void reset_display_size(void) {
+    display_width = desktop_width;
+    display_height = desktop_height;
+    host_window_adapter_mode(&display_width, &display_height);
+}
+
 void host_window_device_mode(uint32_t width,uint32_t height,int windowed){
     if(!width||!height||width>16384||height>16384)return;
     if(!windowed){display_width=client_width=width;display_height=client_height=height;}
-    else {display_width=desktop_width;display_height=desktop_height;}
+    else reset_display_size();
     __android_log_print(ANDROID_LOG_INFO,"FNVWindow","device mode=%ux%u windowed=%d client=%ux%u display=%ux%u",width,height,windowed,client_width,client_height,display_width,display_height);
 }
 #endif
@@ -38,13 +58,17 @@ static QMsg mq[512]; static int mq_h, mq_t;
 static pthread_mutex_t mq_lk = PTHREAD_MUTEX_INITIALIZER;
 #ifdef __ANDROID__
 void host_window_configure(uint32_t width, uint32_t height) {
-    if (width && height && width <= 16384 && height <= 16384) { desktop_width=display_width=width;desktop_height=display_height=height; }
+    if (width && height && width <= 16384 && height <= 16384) {
+        desktop_width = width;
+        desktop_height = height;
+        reset_display_size();
+    }
 }
 void host_win_reset(void) {
     pthread_mutex_lock(&mq_lk);
     wndproc = 0; mq_h = mq_t = 0;
     pthread_mutex_unlock(&mq_lk);
-    display_width=desktop_width;display_height=desktop_height;
+    reset_display_size();
     client_width = display_width; client_height = display_height;
 }
 void host_pump_events(void) { /* Surface/input event bridge is a separate layer. */ }
@@ -240,7 +264,8 @@ int host_win_selftest(void) {
     metric[0]=0;
     if(host_shim_test_call(GetSystemMetrics_,metric,1)!=800||!host_shim_test_call(GetClientRect_,rectangle,2)||G32(0x240008)!=800||G32(0x24000c)!=600)return 11;
     host_window_device_mode(640,480,1);
-    if(host_shim_test_call(GetSystemMetrics_,metric,1)!=desktop_width||!host_shim_test_call(GetClientRect_,rectangle,2)||G32(0x240008)!=800)return 12;
+    if(host_shim_test_call(GetSystemMetrics_,metric,1)!=(render_width ? render_width : desktop_width)||
+       !host_shim_test_call(GetClientRect_,rectangle,2)||G32(0x240008)!=800)return 12;
     uint32_t peek[] = {0x240000, 0, 0, 0, 0};
     if (!host_shim_test_call(PeekMessageA_, peek, 5) || G32(0x240004) != 0x1c) return 4;
     peek[4] = 1;

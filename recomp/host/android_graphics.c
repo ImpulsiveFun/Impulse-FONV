@@ -3,14 +3,18 @@
 // D3D shader bytecode uses the shared decoder with a GLSL stage emitter.
 #include <EGL/egl.h>
 #include <GLES3/gl31.h>
+#include <GLES2/gl2ext.h>
 #include <android/log.h>
 #include <android/native_window.h>
+#include <android/performance_hint.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 #include "com.h"
 #include "d3d9_backend.h"
 #include "sm2msl.h"
@@ -24,19 +28,67 @@ static EGLConfig config;
 static unsigned width, height, pbuffer_width, pbuffer_height;
 static pthread_mutex_t surface_lock = PTHREAD_MUTEX_INITIALIZER;
 static ANativeWindow *pending_window, *active_window;
+static int pending_window_width,pending_window_height;
 static uint64_t pending_generation, active_generation = UINT64_MAX;
 static int test_presentation;
 static uint64_t previous_frame_draws;
+static APerformanceHintSession *frame_hint;
+static void (*close_frame_hint)(APerformanceHintSession *);
+static int (*report_frame_hint)(APerformanceHintSession *,int64_t);
+static int32_t frame_hint_thread;
+static uint64_t previous_swap_ns;
+
+static void reset_frame_hint(void) {
+    if(frame_hint)close_frame_hint(frame_hint);
+    frame_hint=NULL;
+    frame_hint_thread=0;
+    previous_swap_ns=0;
+}
+
+static void report_frame_work(void) {
+    int32_t thread=gettid();
+    if(thread!=frame_hint_thread) {
+        reset_frame_hint();
+        frame_hint_thread=thread;
+        // The native service was added in Android 13. Resolve it at runtime.
+        static void *android_library;
+        if(!android_library)android_library=dlopen("libandroid.so",RTLD_NOW|RTLD_LOCAL);
+        if(!android_library)return;
+        APerformanceHintManager *(*manager)(void)=dlsym(android_library,"APerformanceHint_getManager");
+        APerformanceHintSession *(*create)(APerformanceHintManager *,const int32_t *,size_t,int64_t)
+            =dlsym(android_library,"APerformanceHint_createSession");
+        close_frame_hint=dlsym(android_library,"APerformanceHint_closeSession");
+        report_frame_hint=dlsym(android_library,"APerformanceHint_reportActualWorkDuration");
+        if(!manager||!create||!close_frame_hint||!report_frame_hint)return;
+        APerformanceHintManager *service=manager();
+        if(!service)return;
+        // Leave a few milliseconds in the 30 FPS budget for final presentation.
+        frame_hint=create(service,&thread,1,30000000);
+        if(frame_hint)__android_log_print(ANDROID_LOG_INFO,"FNVGraphics","Android frame scheduling hint enabled");
+    }
+    if(frame_hint&&previous_swap_ns) {
+        uint64_t elapsed=rt_rdtsc()-previous_swap_ns;
+        if(elapsed>0&&elapsed<=250000000&&report_frame_hint(frame_hint,elapsed)) {
+            close_frame_hint(frame_hint);
+            frame_hint=NULL;
+        }
+    }
+}
 static uint32_t cached_render_states[256],cached_viewport[6],cached_scissor[4];
 enum { INVALID_MASKS=1, INVALID_SCISSOR=2, INVALID_ALL=4 };
 static unsigned render_state_invalid=INVALID_ALL;
 static _Atomic int debug_capture_requested;
+static _Atomic uint64_t window_frames;
 void host_graphics_request_capture(void){atomic_store(&debug_capture_requested,1);}
+uint64_t host_graphics_window_frames(void) {
+    return atomic_load_explicit(&window_frames, memory_order_relaxed);
+}
 // Serialize imports while retaining EGL across consecutive graphics calls.
 // Owners yield before nongraphics imports, at requested runtime polls, or on exit.
 static pthread_mutex_t graphics_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t graphics_available=PTHREAD_COND_INITIALIZER;
 static _Thread_local unsigned graphics_depth;
+static _Thread_local int graphics_locked;
 static _Thread_local int retained_on_thread;
 static _Atomic int retain_context,context_handoff;
 static pthread_t context_owner;
@@ -70,38 +122,53 @@ void host_graphics_retain(int enabled) {
 }
 
 void host_graphics_enter(void) {
-    if(!graphics_depth) {
+    // Retention already excludes other threads from the renderer. The owner
+    // only takes the mutex again when it changes or relinquishes ownership.
+    if(!graphics_depth&&!retained_on_thread) {
         pthread_mutex_lock(&graphics_lock);
         while(owner_valid&&!pthread_equal(context_owner,pthread_self())) {
             atomic_store(&context_handoff,1);
             pthread_cond_wait(&graphics_available,&graphics_lock);
         }
+        graphics_locked=1;
     }
     ++graphics_depth;
 }
 void host_graphics_leave(void) {
     if(!graphics_depth)return;
     if(--graphics_depth)return;
-    if(atomic_load(&retain_context)&&context!=EGL_NO_CONTEXT&&eglGetCurrentContext()==context) {
+    if(!graphics_locked) {
+        if(atomic_load(&retain_context))return;
+        host_graphics_yield();
+        return;
+    }
+    if(atomic_load(&retain_context)&&context!=EGL_NO_CONTEXT&&
+       (retained_on_thread||eglGetCurrentContext()==context)) {
         context_owner=pthread_self();
         owner_valid=1;
         retained_on_thread=1;
     } else release_context_locked();
+    graphics_locked=0;
     pthread_mutex_unlock(&graphics_lock);
 }
 void host_graphics_unwind(void) {
     if(graphics_depth) {
         graphics_depth=0;
+        if(!graphics_locked)pthread_mutex_lock(&graphics_lock);
         release_context_locked();
+        graphics_locked=0;
         pthread_mutex_unlock(&graphics_lock);
     } else host_graphics_yield();
 }
 
 // Takes ownership of the reference returned by ANativeWindow_fromSurface.
-void host_graphics_set_surface(ANativeWindow *window) {
+void host_graphics_set_surface(ANativeWindow *window,int window_width,int window_height) {
     pthread_mutex_lock(&surface_lock);
     ANativeWindow *old = pending_window;
-    pending_window = window; ++pending_generation;
+    pending_window=window;
+    pending_window_width=window_width;
+    pending_window_height=window_height;
+    ++pending_generation;
     pthread_mutex_unlock(&surface_lock);
     if (old) ANativeWindow_release(old);
 }
@@ -110,6 +177,13 @@ static void reset_programs(void);
 static void reset_textures(void);
 static int texture_bridge_selftest(void);
 static GLuint vao, scratch_vb, scratch_ib, constants[2], vertex_buffers[16];
+static GLuint bound_vertex_buffer,bound_index_buffer;
+static void bind_geometry_buffer(GLenum target,GLuint name) {
+    GLuint *bound=target==GL_ARRAY_BUFFER?&bound_vertex_buffer:&bound_index_buffer;
+    if(*bound==name)return;
+    glBindBuffer(target,name);
+    *bound=name;
+}
 static GLuint bound_read_fb,bound_draw_fb;
 static void bind_framebuffer(GLenum target,GLuint framebuffer) {
     if ((target==GL_DRAW_FRAMEBUFFER||bound_read_fb==framebuffer) &&
@@ -129,6 +203,89 @@ static size_t geometry_bytes;
 // The two UBO bindings are shared by every linked program in this context.
 static unsigned char constant_shadow[2][4416];
 static unsigned constant_valid;
+enum { CONSTANT_PAGES=4, CONSTANT_SLOTS_PER_PAGE=128 };
+typedef struct {
+    GLuint name;
+    unsigned char *mapping;
+    size_t stride;
+    unsigned page, used;
+    GLsync fences[CONSTANT_PAGES];
+} ConstantStream;
+static ConstantStream constant_streams[2];
+static int constant_streams_checked;
+
+static void reset_constant_streams(void) {
+    for(unsigned slot=0;slot<2;++slot) {
+        ConstantStream *stream=&constant_streams[slot];
+        if(context==EGL_NO_CONTEXT)continue;
+        for(unsigned page=0;page<CONSTANT_PAGES;++page)
+            if(stream->fences[page])glDeleteSync(stream->fences[page]);
+        if(stream->name)glDeleteBuffers(1,&stream->name);
+    }
+    memset(constant_streams,0,sizeof constant_streams);
+    constant_streams_checked=0;
+}
+
+static void init_constant_streams(void) {
+    constant_streams_checked=1;
+    GLint count=0;
+    glGetIntegerv(GL_NUM_EXTENSIONS,&count);
+    for(GLint i=0;i<count;++i) {
+        const char *extension=(const char *)glGetStringi(GL_EXTENSIONS,i);
+        if(!extension||strcmp(extension,"GL_EXT_buffer_storage"))continue;
+        PFNGLBUFFERSTORAGEEXTPROC storage=(PFNGLBUFFERSTORAGEEXTPROC)eglGetProcAddress("glBufferStorageEXT");
+        if(!storage)return;
+        GLint alignment=0;
+        glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT,&alignment);
+        if(alignment<=0||alignment>4096)return;
+        GLbitfield flags=GL_MAP_WRITE_BIT|GL_MAP_PERSISTENT_BIT_EXT|GL_MAP_COHERENT_BIT_EXT;
+        for(unsigned slot=0;slot<2;++slot) {
+            ConstantStream *stream=&constant_streams[slot];
+            size_t block=sizeof constant_shadow[slot];
+            stream->stride=(block+alignment-1)/alignment*alignment;
+            size_t size=stream->stride*CONSTANT_SLOTS_PER_PAGE*CONSTANT_PAGES;
+            glGenBuffers(1,&stream->name);
+            glBindBuffer(GL_UNIFORM_BUFFER,stream->name);
+            storage(GL_UNIFORM_BUFFER,size,NULL,flags);
+            if(glGetError()==GL_NO_ERROR)
+                stream->mapping=glMapBufferRange(GL_UNIFORM_BUFFER,0,size,flags);
+            if(!stream->mapping) {
+                glGetError();
+                reset_constant_streams();
+                constant_streams_checked=1;
+                __android_log_print(ANDROID_LOG_WARN,"FNVGraphics","Persistent shader constants unavailable; using ordinary uploads");
+                return;
+            }
+        }
+        __android_log_print(ANDROID_LOG_INFO,"FNVGraphics","Persistent shader constants enabled");
+        return;
+    }
+}
+
+static int stream_constant_block(unsigned slot,const void *bytes,size_t size) {
+    if(!constant_streams_checked)init_constant_streams();
+    ConstantStream *stream=&constant_streams[slot];
+    if(!stream->mapping)return 0;
+    if(stream->used==CONSTANT_SLOTS_PER_PAGE) {
+        unsigned next=(stream->page+1)%CONSTANT_PAGES;
+        if(stream->fences[next]) {
+            GLenum status=glClientWaitSync(stream->fences[next],0,0);
+            if(status!=GL_ALREADY_SIGNALED&&status!=GL_CONDITION_SATISFIED)return 0;
+            glDeleteSync(stream->fences[next]);
+            stream->fences[next]=NULL;
+        }
+        // Each stage retires its own page only when a new range replaces its binding.
+        // If the GPU is behind, leave mapped pages untouched and use the ordinary buffer.
+        stream->fences[stream->page]=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);
+        if(!stream->fences[stream->page])return 0;
+        stream->page=next;
+        stream->used=0;
+    }
+    size_t offset=(stream->page*CONSTANT_SLOTS_PER_PAGE+stream->used++)*stream->stride;
+    memcpy(stream->mapping+offset,bytes,size);
+    glBindBufferRange(GL_UNIFORM_BUFFER,slot,stream->name,offset,size);
+    return 1;
+}
 typedef struct {
     GLuint buffer;
     GLenum type;
@@ -326,10 +483,12 @@ static void reset_event_queries(void){
     reported_visibility=0;
 }
 static void graphics_reset_impl(void) {
+    reset_frame_hint();
     if(context!=EGL_NO_CONTEXT)eglMakeCurrent(display,surface,surface,context);
     reset_programs();
     reset_textures();
     reset_event_queries();
+    reset_constant_streams();
     if (display != EGL_NO_DISPLAY) {
         eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);
         if (surface != EGL_NO_SURFACE) eglDestroySurface(display,surface);
@@ -344,6 +503,7 @@ static void graphics_reset_impl(void) {
     atomic_store(&context_handoff,0);
     pthread_cond_broadcast(&graphics_available);
     bound_read_fb=bound_draw_fb=0;
+    bound_vertex_buffer=bound_index_buffer=0;
     constant_valid=0;
     render_state_invalid=INVALID_ALL;
     memset(attribute_cache,0,sizeof attribute_cache);
@@ -354,24 +514,44 @@ static void graphics_reset_impl(void) {
     vao=scratch_vb=scratch_ib=constants[0]=constants[1]=0; memset(vertex_buffers,0,sizeof vertex_buffers); width=height=0;
 }
 void host_graphics_reset(void) {
-    host_graphics_enter();graphics_reset_impl();previous_frame_draws=0;host_graphics_leave();
+    host_graphics_enter();
+    if(!graphics_locked) {
+        pthread_mutex_lock(&graphics_lock);
+        graphics_locked=1;
+    }
+    graphics_reset_impl();
+    previous_frame_draws=0;
+    host_graphics_leave();
 }
 // Surface lifecycle calls only publish a window. EGL remains on the guest's
 // rendering thread, including destruction and replacement of old surfaces.
-static int refresh_surface(void) {
+static int refresh_surface(unsigned game_width,unsigned game_height) {
     pthread_mutex_lock(&surface_lock);
     uint64_t generation=pending_generation;
     ANativeWindow *next=pending_window;
+    int window_width=pending_window_width,window_height=pending_window_height;
     if(next)ANativeWindow_acquire(next);
     pthread_mutex_unlock(&surface_lock);
     if(generation==active_generation){if(next)ANativeWindow_release(next);return 1;}
+    reset_frame_hint();
     eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);
     if(surface!=EGL_NO_SURFACE)eglDestroySurface(display,surface);
     if(active_window)ANativeWindow_release(active_window);
     active_window=next;active_generation=generation;
     if(next) {
         EGLint visual;eglGetConfigAttrib(display,config,EGL_NATIVE_VISUAL_ID,&visual);
-        if(ANativeWindow_setBuffersGeometry(next,0,0,visual))return 0;
+        int buffer_width=0,buffer_height=0;
+        if(window_width>0&&window_height>0&&game_width&&game_height) {
+            // Keep the window aspect, including bars, and let Android scale the
+            // finished buffer. Avoid drawing more pixels than the window needs.
+            double scale=fmax((double)game_width/window_width,(double)game_height/window_height);
+            if(scale<1.0) {
+                buffer_width=(int)lround(window_width*scale);
+                buffer_height=(int)lround(window_height*scale);
+            }
+        }
+        if(ANativeWindow_setBuffersGeometry(next,buffer_width,buffer_height,visual)&&
+           ANativeWindow_setBuffersGeometry(next,0,0,visual))return 0;
         surface=eglCreateWindowSurface(display,config,next,NULL);
     } else {
         EGLint attributes[]={EGL_WIDTH,(EGLint)pbuffer_width,EGL_HEIGHT,(EGLint)pbuffer_height,EGL_NONE};
@@ -379,6 +559,8 @@ static int refresh_surface(void) {
     }
     if(surface==EGL_NO_SURFACE||!eglMakeCurrent(display,surface,surface,context))return 0;
     EGLint w,h;eglQuerySurface(display,surface,EGL_WIDTH,&w);eglQuerySurface(display,surface,EGL_HEIGHT,&h);
+    if(next&&window_width>0&&window_height>0)
+        __android_log_print(ANDROID_LOG_INFO,"FNVGraphics","Presentation buffer %dx%d for window %dx%d",w,h,window_width,window_height);
     width=w;height=h;return w>0&&h>0;
 }
 static GLuint compile_shader(GLenum stage, const char *source, char *error, size_t size) {
@@ -418,7 +600,7 @@ static int graphics_selftest_impl(void) {
     if(!program){snprintf(graphics_error,sizeof graphics_error,"Shader fixture: %s",error);host_graphics_reset();return 2;}
     use_program(program);glUniform1i(glGetUniformLocation(program,"alpha_func"),8);
     GLfloat triangle[]={-1,-1,0,1, 3,-1,0,1, -1,3,0,1};
-    glBindBuffer(GL_ARRAY_BUFFER,scratch_vb);glBufferData(GL_ARRAY_BUFFER,sizeof triangle,triangle,GL_STREAM_DRAW);
+    bind_geometry_buffer(GL_ARRAY_BUFFER,scratch_vb);glBufferData(GL_ARRAY_BUFFER,sizeof triangle,triangle,GL_STREAM_DRAW);
     glEnableVertexAttribArray(0);glVertexAttribPointer(0,4,GL_FLOAT,GL_FALSE,16,0);
     attribute_state_known=0;
     render_state_invalid=INVALID_ALL;
@@ -434,7 +616,7 @@ static int graphics_selftest_impl(void) {
 // Programs key on immutable guest shader objects, which live until device reset.
 typedef struct Program {
     uint32_t vs,ps,active_samplers;
-    unsigned tests;
+    unsigned tests,constant_blocks;
     GLuint name;
     int counting,manual_depth,visibility_only,uniforms_valid;
     GLint color_mask,halfpixel,clip_enable,clip_planes,alpha_func,alpha_ref;
@@ -523,8 +705,10 @@ static Program *program_for(D3DState *s) {
         p->depth_scale=glGetUniformLocation(p->name,"fnv_depth_scale");
         glUniform1i(glGetUniformLocation(p->name,"fnv_query_depth"),20);
     }
-    GLuint block=glGetUniformBlockIndex(p->name,"VertexConstants");if(block!=GL_INVALID_INDEX)glUniformBlockBinding(p->name,block,0);
-    block=glGetUniformBlockIndex(p->name,"PixelConstants");if(block!=GL_INVALID_INDEX)glUniformBlockBinding(p->name,block,1);
+    GLuint block=glGetUniformBlockIndex(p->name,"VertexConstants");
+    if(block!=GL_INVALID_INDEX){glUniformBlockBinding(p->name,block,0);p->constant_blocks|=1;}
+    block=glGetUniformBlockIndex(p->name,"PixelConstants");
+    if(block!=GL_INVALID_INDEX){glUniformBlockBinding(p->name,block,1);p->constant_blocks|=2;}
     p->next=programs[bucket];programs[bucket]=p;return p;
 }
 static void upload_constant_block(unsigned slot,const void *floats,size_t fsize,
@@ -534,14 +718,17 @@ static void upload_constant_block(unsigned slot,const void *floats,size_t fsize,
        !memcmp(shadow+fsize,integers,isize)&&!memcmp(shadow+fsize+isize,booleans,bsize))return;
     memcpy(shadow,floats,fsize);memcpy(shadow+fsize,integers,isize);
     memcpy(shadow+fsize+isize,booleans,bsize);
-    glBindBuffer(GL_UNIFORM_BUFFER,constants[slot]);
-    glBufferData(GL_UNIFORM_BUFFER,fsize+isize+bsize,shadow,GL_STREAM_DRAW);
-    glBindBufferBase(GL_UNIFORM_BUFFER,slot,constants[slot]);
+    size_t size=fsize+isize+bsize;
+    if(!stream_constant_block(slot,shadow,size)) {
+        glBindBuffer(GL_UNIFORM_BUFFER,constants[slot]);
+        glBufferData(GL_UNIFORM_BUFFER,size,shadow,GL_STREAM_DRAW);
+        glBindBufferBase(GL_UNIFORM_BUFFER,slot,constants[slot]);
+    }
     constant_valid|=1u<<slot;
 }
 static void upload_constants(D3DState *s,Program *p) {
-    upload_constant_block(0,s->vsc,sizeof s->vsc,s->vsi,sizeof s->vsi,s->vsb,sizeof s->vsb);
-    upload_constant_block(1,s->psc,sizeof s->psc,s->psi,sizeof s->psi,s->psb,sizeof s->psb);
+    if(p->constant_blocks&1)upload_constant_block(0,s->vsc,sizeof s->vsc,s->vsi,sizeof s->vsi,s->vsb,sizeof s->vsb);
+    if(p->constant_blocks&2)upload_constant_block(1,s->psc,sizeof s->psc,s->psi,sizeof s->psi,s->psb,sizeof s->psb);
     // Convert D3D9 pixel centres using the current viewport, including offscreen targets.
     int first=!p->uniforms_valid;
     uint32_t w=s->viewport[2],h=s->viewport[3];
@@ -663,7 +850,7 @@ static GLuint bind_geometry(uint32_t object,GLenum target,GLuint streaming_buffe
             }
         }
     }
-    glBindBuffer(target,name?name:streaming_buffer);
+    bind_geometry_buffer(target,name?name:streaming_buffer);
     if(!name||(atomic_guest_read(OF(object,BUFFER_DIRTY))&&atomic_guest_take(OF(object,BUFFER_DIRTY))))
         glBufferData(target,length,MEM+G32(OF(object,BUFFER_DATA)),name?GL_STATIC_DRAW:GL_STREAM_DRAW);
     return name?name:streaming_buffer;
@@ -696,7 +883,7 @@ static void attributes(D3DState *s,Program *p,int up,uint32_t stride,int32_t bas
                 if(!stream_bindings[stream_no])
                     stream_bindings[stream_no]=bind_geometry(buffer,GL_ARRAY_BUFFER,vertex_buffers[stream_no]);
                 else if(bound_stream!=stream_bindings[stream_no])
-                    glBindBuffer(GL_ARRAY_BUFFER,stream_bindings[stream_no]);
+                    bind_geometry_buffer(GL_ARRAY_BUFFER,stream_bindings[stream_no]);
                 bound_stream=stream_bindings[stream_no];
             } else if(stream_no)graphics_fail("User-memory draw uses multiple streams.",10);
             GLenum gltype=GL_FLOAT;GLboolean norm=GL_FALSE;int components=type<=3?type+1:4;
@@ -752,6 +939,8 @@ void d3d_backend_release(uint32_t object){
     if(!name)return;
     event_context(NULL);
     glDeleteBuffers(1,&name);
+    if(bound_vertex_buffer==name)bound_vertex_buffer=0;
+    if(bound_index_buffer==name)bound_index_buffer=0;
     for(unsigned i=0;i<16;++i)if(attribute_cache[i].buffer==name)attribute_cache[i].valid=0;
     geometry_bytes-=G32(OF(object,BUFFER_LENGTH));
     P32(OF(object,BUFFER_NAME),0);
@@ -787,7 +976,7 @@ static void query_depth_snapshot(D3DState *s,Program *program){
         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_COMPARE_MODE,GL_NONE);
         depth_snapshot_width=w;depth_snapshot_height=h;depth_snapshot_format=depth->internal;
     }
-    if(fresh||depth_snapshot_source!=s->ds||depth_snapshot_generation!=depth_generation){
+    if(fresh){
         if(!depth_snapshot_fb)glGenFramebuffers(1,&depth_snapshot_fb);
         bind_framebuffer(GL_DRAW_FRAMEBUFFER,depth_snapshot_fb);
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_TEXTURE_2D,0,0);
@@ -795,6 +984,9 @@ static void query_depth_snapshot(D3DState *s,Program *program){
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,depth->external==GL_DEPTH_STENCIL?GL_DEPTH_STENCIL_ATTACHMENT:GL_DEPTH_ATTACHMENT,GL_TEXTURE_2D,depth_snapshot,0);
         GLenum none=GL_NONE;glDrawBuffers(1,&none);
         if(glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)graphics_fail("Occlusion depth snapshot framebuffer is incomplete.",77);
+    }
+    if(fresh||depth_snapshot_source!=s->ds||depth_snapshot_generation!=depth_generation){
+        bind_framebuffer(GL_DRAW_FRAMEBUFFER,depth_snapshot_fb);
         render_state_invalid|=INVALID_SCISSOR;
         bind_framebuffer(GL_READ_FRAMEBUFFER,output_fb);glDisable(GL_SCISSOR_TEST);
         unsigned copy_w=w<target_width?w:target_width,copy_h=h<target_height?h:target_height;
@@ -825,8 +1017,8 @@ void d3d_backend_draw(D3DState *s,uint32_t prim,uint32_t start,uint32_t count,in
 void d3d_backend_draw_up(D3DState *s,uint32_t prim,uint32_t count,uint32_t data,uint32_t stride,uint32_t indices,uint32_t format,uint32_t min,uint32_t vertices){
     Program *p=prepare_draw(s);GLsizei n;GLenum mode=primitive(prim,count,&n);size_t bytes=(indices?(size_t)min+vertices:(size_t)n)*stride;
     if(bytes>128*1024*1024)graphics_fail("User-memory vertex range too large.",18);
-    glBindBuffer(GL_ARRAY_BUFFER,scratch_vb);glBufferData(GL_ARRAY_BUFFER,bytes,MEM+data,GL_STREAM_DRAW);attributes(s,p,1,stride,0);
-    if(indices){int size=format==101?2:4;glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,scratch_ib);glBufferData(GL_ELEMENT_ARRAY_BUFFER,n*size,MEM+indices,GL_STREAM_DRAW);draw_counted(p,mode,n,0,size==2?GL_UNSIGNED_SHORT:GL_UNSIGNED_INT,0);}else draw_counted(p,mode,n,0,0,0);
+    bind_geometry_buffer(GL_ARRAY_BUFFER,scratch_vb);glBufferData(GL_ARRAY_BUFFER,bytes,MEM+data,GL_STREAM_DRAW);attributes(s,p,1,stride,0);
+    if(indices){int size=format==101?2:4;bind_geometry_buffer(GL_ELEMENT_ARRAY_BUFFER,scratch_ib);glBufferData(GL_ELEMENT_ARRAY_BUFFER,n*size,MEM+indices,GL_STREAM_DRAW);draw_counted(p,mode,n,0,size==2?GL_UNSIGNED_SHORT:GL_UNSIGNED_INT,0);}else draw_counted(p,mode,n,0,0,0);
     if(glGetError()!=GL_NO_ERROR)graphics_fail("OpenGL ES user-memory draw failed.",19);s->draws++;if(s->ds&&s->rs[7]&&s->rs[14])++depth_generation;
 }
 
@@ -881,15 +1073,22 @@ int host_graphics_capture(D3DState *s,const char *path) {
     host_graphics_enter();int result=graphics_capture_impl(s,path);host_graphics_leave();return result;
 }
 void d3d_backend_present(D3DState *s){
-    target(s);if(!refresh_surface())graphics_fail("Android screen surface is unavailable.",63);
+    target(s);if(!refresh_surface(s->width,s->height))graphics_fail("Android screen surface is unavailable.",63);
     if(!read_fb)glGenFramebuffers(1,&read_fb);bind_framebuffer(GL_READ_FRAMEBUFFER,read_fb);attach_surface(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,s->backbuffer);glReadBuffer(GL_COLOR_ATTACHMENT0);
-    render_state_invalid|=INVALID_MASKS|INVALID_SCISSOR;
+    render_state_invalid|=INVALID_SCISSOR;
     bind_framebuffer(GL_DRAW_FRAMEBUFFER,0);glDisable(GL_SCISSOR_TEST);
-    glColorMask(1,1,1,1);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);
     double scale=fmin((double)width/s->width,(double)height/s->height);
     int w=(int)(s->width*scale),h=(int)(s->height*scale),x=((int)width-w)/2,y=((int)height-h)/2;
+    // A full-window blit overwrites the previous contents. Clear for letterbox bars only.
+    if(w!=(int)width||h!=(int)height){
+        render_state_invalid|=INVALID_MASKS;
+        glColorMask(1,1,1,1);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);
+    }
     glBlitFramebuffer(0,s->height,s->width,0,x,y,x+w,y+h,GL_COLOR_BUFFER_BIT,GL_LINEAR);
+    if(active_window&&s->frames>=120)report_frame_work();
     if(glGetError()!=GL_NO_ERROR||!eglSwapBuffers(display,surface))graphics_fail("OpenGL ES presentation failed.",27);s->frames++;
+    if(frame_hint)previous_swap_ns=rt_rdtsc();
+    if(active_window)atomic_fetch_add_explicit(&window_frames,1,memory_order_relaxed);
     input_frame_draws(s->draws>=previous_frame_draws?s->draws-previous_frame_draws:s->draws);
     previous_frame_draws=s->draws;input_script_tick(s->frames);
     if(input_take_dump_request())atomic_store(&debug_capture_requested,1);
@@ -1002,6 +1201,32 @@ static void texture_bridge_fixture(CPU *cpu) {
     d3d_backend_draw_up(&s,4,1,verts,16,0,0,0,0);
     uint8_t pixel[4]={0};glReadPixels(8,8,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
     if(memcmp(pixel,(uint8_t[]){0,0,255,255},4)){RET(cpu,1,0);return;}
+    // Use a distinct solid DXT1 color at each mip so both reduced modes can be
+    // checked by sampling, even when the game asks for a non-mipmapped filter.
+    unsigned saved_skip=texture_mip_skip;
+    const uint32_t colors565[]={0xf800,0x07e0,0x001f};
+    const uint8_t expected_mip[3][4]={{255,0,0,255},{0,255,0,255},{0,0,255,255}};
+    for(unsigned skip=1;skip<=2;++skip){
+        uint32_t mip_test=d3d9_create_texture(0,0,8,8,3,0,0x31545844,1);
+        for(unsigned level=0;level<3;++level){
+            uint32_t blocks=d3d9_texture_level_data(mip_test,0,level,&pitch,&size);
+            for(unsigned offset=0;offset+8<=size;offset+=8){
+                P32(blocks+offset,colors565[level]);P32(blocks+offset+4,0);
+            }
+        }
+        d3d9_texture_dirty(mip_test);
+        s.tex[0]=mip_test;
+        texture_mip_skip=skip;
+        d3d_backend_draw_up(&s,4,1,verts,16,0,0,0,0);
+        texture_mip_skip=saved_skip;
+        glReadPixels(8,8,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
+        if(memcmp(pixel,expected_mip[skip],4)){RET(cpu,80+skip,0);return;}
+        texture_for_use(mip_test,0);
+        d3d_backend_draw_up(&s,4,1,verts,16,0,0,0,0);
+        glReadPixels(8,8,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
+        if(memcmp(pixel,expected_mip[0],4)){RET(cpu,83,0);return;}
+    }
+    s.tex[0]=blue;
     uint32_t textured_ps=s.ps;
     for(unsigned dimension=2;dimension<=4;++dimension){
         uint32_t code[sizeof ps/4];memcpy(code,ps,sizeof ps);

@@ -1,10 +1,13 @@
 // Included by android_graphics.c after OF and graphics_fail.
-typedef struct { uint32_t object; GLuint name; GLenum target, internal, external, type; unsigned width,height,levels,faces; uint32_t format; } GLTexture;
+typedef struct { uint32_t object; GLuint name; GLenum target, internal, external, type; unsigned width,height,levels,faces,base_level; uint32_t format; uint64_t image_revision; } GLTexture;
+static unsigned texture_mip_skip;
+void host_graphics_configure_texture_detail(unsigned skip) { texture_mip_skip=skip<=2?skip:0; }
 static GLTexture *texture_objects[65536];
 static unsigned texture_count;
 static GLTexture null_textures[3];
 static GLuint samplers[20], output_fb, read_fb, write_fb;
-static uint64_t image_generation, output_generation;
+static uint64_t image_revision;
+static uint64_t output_revisions[5];
 static uint32_t output_targets[4], output_depth;
 static int output_valid;
 static unsigned active_texture_unit;
@@ -74,10 +77,10 @@ static void upload_surface(GLTexture *texture,uint32_t surf,unsigned face,unsign
     }
     GLenum target=texture->target==GL_TEXTURE_CUBE_MAP?GL_TEXTURE_CUBE_MAP_POSITIVE_X+face:GL_TEXTURE_2D;
     glPixelStorei(GL_UNPACK_ALIGNMENT,1);
-    glTexImage2D(target,level,texture->internal,w,h,0,texture->external,texture->type,converted?converted:source);
+    glTexImage2D(target,level-texture->base_level,texture->internal,w,h,0,texture->external,texture->type,converted?converted:source);
     d3d_surf_end();free(converted);
     if(glGetError()!=GL_NO_ERROR)graphics_fail("Texture upload failed.",42);
-    ++image_generation;
+    texture->image_revision=++image_revision;
 }
 static GLTexture *texture_for_use(uint32_t object,int bind) {
     if(!object)return NULL;
@@ -95,17 +98,27 @@ static GLTexture *texture_for_use(uint32_t object,int bind) {
         t->levels=kind==4?1:G32(OF(object,2));t->faces=kind==2?6:1;
         t->format=G32(OF(object,kind==4?2:3));t->target=kind==2?GL_TEXTURE_CUBE_MAP:GL_TEXTURE_2D;
         if(!t->width||!t->height||t->width>8192||t->height>8192||!t->levels||t->levels>14){free(t);graphics_fail("Invalid texture dimensions.",46);}
+        if(bind&&kind==1&&!G32(OF(object,4))&&
+           (t->format==0x31545844||t->format==0x33545844||t->format==0x35545844))
+            t->base_level=texture_mip_skip<t->levels?texture_mip_skip:t->levels-1;
         surface_format(t->format,&t->internal,&t->external,&t->type);
         glGenTextures(1,&t->name);texture_objects[texture_count++]=t;atomic_guest_write(host_field,texture_count);fresh=1;
     }
     int dirty=atomic_guest_read(dirty_field)&&atomic_guest_take(dirty_field);
-    if(bind||fresh||dirty)bind_texture(t->target,t->name);
-    if(fresh)glTexParameteri(t->target,GL_TEXTURE_MAX_LEVEL,t->levels-1);
-    if(fresh||dirty) {
+    // An attachment or blit can reference any guest mip, including a skipped one.
+    int restore_levels=!bind&&t->base_level;
+    if(restore_levels)t->base_level=0;
+    if(bind||fresh||dirty||restore_levels)bind_texture(t->target,t->name);
+    // Define a contiguous GLES chain starting at level zero, even when the
+    // selected detail drops the largest guest mip levels.
+    if(fresh||restore_levels)
+        glTexParameteri(t->target,GL_TEXTURE_MAX_LEVEL,t->levels-1-t->base_level);
+    if(fresh||dirty||restore_levels) {
         if(kind==4){atomic_guest_take(OF(object,10));upload_surface(t,object,0,0);}
-        else for(unsigned face=0;face<t->faces;++face)for(unsigned level=0;level<t->levels;++level) {
+        else for(unsigned face=0;face<t->faces;++face)for(unsigned level=t->base_level;level<t->levels;++level) {
             uint32_t surf=G32(G32(OF(object,6))+4*(face*t->levels+level));
-            if(fresh||atomic_guest_take(OF(surf,10))){if(fresh)atomic_guest_take(OF(surf,10));upload_surface(t,surf,face,level);}
+            int changed=atomic_guest_take(OF(surf,10));
+            if(fresh||restore_levels||changed)upload_surface(t,surf,face,level);
         }
     }
     return t;
@@ -130,9 +143,13 @@ static void bind_target(D3DState *s) {
     GLTexture *depth=texture_for_use(s->ds,0);
     target_width=s->rt[0]?G32(OF(s->rt[0],0)):s->width;
     target_height=s->rt[0]?G32(OF(s->rt[0],1)):s->height;
-    // Check uploads first because glTexImage2D can replace an attached image.
-    if(output_valid&&output_generation==image_generation&&output_depth==s->ds&&
-       !memcmp(output_targets,s->rt,sizeof output_targets))return;
+    // Only a change to an attached image can invalidate this framebuffer.
+    // Include image revisions so reused guest handles cannot match stale GL textures.
+    uint64_t revisions[5]={0,0,0,0,depth?depth->image_revision:0};
+    for(int i=0;i<4;++i)if(colors[i])revisions[i]=colors[i]->image_revision;
+    if(output_valid&&output_depth==s->ds&&
+       !memcmp(output_targets,s->rt,sizeof output_targets)&&
+       !memcmp(output_revisions,revisions,sizeof revisions))return;
     output_valid=0;
     GLenum buffers[4];int count=0;
     for(int i=0;i<4;++i){attach_texture(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0+i,s->rt[i],colors[i]);buffers[i]=s->rt[i]?GL_COLOR_ATTACHMENT0+i:GL_NONE;if(s->rt[i])count=i+1;}
@@ -142,7 +159,8 @@ static void bind_target(D3DState *s) {
     if(depth)attach_texture(GL_FRAMEBUFFER,depth->external==GL_DEPTH_STENCIL?GL_DEPTH_STENCIL_ATTACHMENT:GL_DEPTH_ATTACHMENT,s->ds,depth);
     if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)graphics_fail("Incomplete render-target framebuffer.",47);
     memcpy(output_targets,s->rt,sizeof output_targets);
-    output_depth=s->ds;output_generation=image_generation;output_valid=1;
+    memcpy(output_revisions,revisions,sizeof output_revisions);
+    output_depth=s->ds;output_valid=1;
 }
 static GLenum address_mode(unsigned mode){switch(mode){case 0:case 1:return GL_REPEAT;case 2:return GL_MIRRORED_REPEAT;case 3:return GL_CLAMP_TO_EDGE;default:graphics_fail("Texture border addressing is pending.",48);return GL_CLAMP_TO_EDGE;}}
 static GLTexture *null_texture_for(unsigned dimension){

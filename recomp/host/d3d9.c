@@ -765,7 +765,14 @@ static void D3D_EnumAdapterModes(CPU *c) {
     P32(m, modes[i].w); P32(m + 4, modes[i].h); P32(m + 8, 60); P32(m + 12, ARG(c, 2) ? ARG(c, 2) : 22);
     RET(c, 0, 5);
 }
-static void D3D_GetAdapterDisplayMode(CPU *c) { uint32_t m = ARG(c, 2); P32(m, 1920); P32(m + 4, 1080); P32(m + 8, 60); P32(m + 12, 22); RET(c, 0, 3); }
+static void D3D_GetAdapterDisplayMode(CPU *c) {
+    uint32_t m = ARG(c, 2), width = 1920, height = 1080;
+#ifdef __ANDROID__
+    extern void host_window_adapter_mode(uint32_t *width, uint32_t *height);
+    host_window_adapter_mode(&width, &height);
+#endif
+    P32(m, width); P32(m + 4, height); P32(m + 8, 60); P32(m + 12, 22); RET(c, 0, 3);
+}
 static void D3D_CheckDeviceMultiSampleType(CPU *c) { if (ARG(c, 6)) P32(ARG(c, 6), 1); RET(c, ARG(c, 5) == 0 ? 0 : D3DERR_NOTAVAILABLE, 7); }
 static void D3D_GetAdapterMonitor(CPU *c) { RET(c, 0x00070001, 2); }
 
